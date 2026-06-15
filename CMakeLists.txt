@@ -17,3 +17,7 @@ target_link_libraries(tinytorch INTERFACE Eigen3::Eigen)
 
 add_executable(test_tensor tests/test_tensor.cpp)
 target_link_libraries(test_tensor PRIVATE tinytorch)
+add_executable(test_activations tests/test_activations.cpp)
+target_link_libraries(test_activations PRIVATE tinytorch)
+add_executable(test_layers tests/test_layers.cpp)
+target_link_libraries(test_layers PRIVATE tinytorch)

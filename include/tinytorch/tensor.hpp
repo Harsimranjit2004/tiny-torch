@@ -991,6 +991,21 @@ public:
 
         return Tensor(std::move(out), {M, N});
     }
+
+    float item() const {
+        if (numel() != 1)
+            throw std::invalid_argument(
+                "item() requires a single-element tensor\n"
+                "  ❌ Tensor has " + std::to_string(numel()) + " elements\n"
+                "  💡 item() extracts the one value from a scalar/size-1 tensor\n"
+                "  🔧 Fix: reduce to a scalar first, or index a single element"
+            );
+        std::vector<size_t> z(shape.size(), 0);   // {0,0,...} or {} for 0-D
+        return at(z);
+    }
+
+
+
 };
 
 inline std::ostream& operator<<(std::ostream& os, const Tensor& t) {
