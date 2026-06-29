@@ -450,6 +450,29 @@ public:
 
         return out;
     }
+
+    Tensor index_dim(size_t dim, size_t idx) const {
+        if (dim >= ndim()) {
+            throw std::out_of_range(
+                "index_dim: invalid dimension"
+            );
+        }
+
+        if (idx >= shape[dim]) {
+            throw std::out_of_range(
+                "index_dim: index out of bounds"
+            );
+        }
+
+        Tensor out = shallow_copy();
+
+        out.offset += idx * strides[dim];
+
+        out.shape.erase(out.shape.begin() + dim);
+        out.strides.erase(out.strides.begin() + dim);
+
+        return out;
+    }
     std::string vec_to_string(const std::vector<size_t>& v) const {
         std::ostringstream oss;
         oss << "{";
