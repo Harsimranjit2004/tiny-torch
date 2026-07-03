@@ -24,6 +24,29 @@ static size_t numel_from_shape(const std::vector<size_t>& shape) {
     return total;
 }
 class Tensor;
+struct Function;
+struct AutogradMeta;
+
+struct Function {
+    std::vector<Tensor> inputs;
+
+    virtual ~Function() = default;
+
+    virtual std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) = 0;
+};
+
+struct AutogradMeta {
+    std::shared_ptr<Tensor> grad;
+
+    std::shared_ptr<Function> grad_fn;
+
+    bool requires_grad = false;
+
+    bool grad_initialized = false;
+};
+
 inline std::vector<size_t> broadcast_shapes(const std::vector<size_t>& a,
                                             const std::vector<size_t>& b);
 inline Tensor zeros(const std::vector<size_t>& shape);
@@ -31,7 +54,6 @@ inline Tensor ones(const std::vector<size_t>& shape);
 inline Tensor full(const std::vector<size_t>& shape, float value);
 inline Tensor operator/(const Tensor& a, const Tensor& b);
 inline Tensor operator/(const Tensor& a, float b);
-// (the full definitions remain below, unchanged)
 
 class Tensor {
 private:
@@ -122,8 +144,8 @@ private:
 
         return out_idx;
     }
-
-public:
+    public:
+    std::shared_ptr<AutogradMeta> autograd;
     std::shared_ptr<std::vector<float>> storage;
     std::vector<size_t> shape;
     std::vector<size_t> strides;
@@ -267,41 +289,16 @@ public:
 
         return out;
     }
-
-    Tensor transpose(int d0 = -2, int d1 = -1) const {
-        if (ndim() < 2 && d0 == -2 && d1 == -1) {
-            return shallow_copy();
-        }
-
-        int n = static_cast<int>(ndim());
-
-        if (d0 < 0) d0 += n;
-        if (d1 < 0) d1 += n;
-
-        if (d0 < 0 || d0 >= n || d1 < 0 || d1 >= n) {
-            throw std::out_of_range(
-                "Transpose dimension out of range\n"
-                "  ❌ Invalid dimensions\n"
-                "  💡 Dimensions must be in [-ndim(), ndim()-1]"
-            );
-        }
-
-        Tensor out = shallow_copy();
-
-        std::swap(out.shape[d0], out.shape[d1]);
-        std::swap(out.strides[d0], out.strides[d1]);
-
-        return out;
-    }
-
+    Tensor transpose(
+    int dim0 = -2,
+    int dim1 = -1
+) const;
+    
     bool is_contiguous() const {
         if (numel() <= 1) {
             return true;
         }
 
-        // Simple correct check.
-        // Note: shapes with size-1 dims can be contiguous with unusual strides.
-        // This may give false negatives, causing unnecessary copies, but not wrong results.
         return strides == compute_strides(shape);
     }
 
@@ -333,101 +330,10 @@ public:
         return Tensor(std::move(data), shape);
     }
 
-    Tensor reshape(const std::vector<long>& new_shape) const {
-        int infer_count = 0;
-        long infer_pos = -1;
+    Tensor reshape(const std::vector<long>& new_shape) const;
 
-        size_t known_product = 1;
-
-        for (size_t i = 0; i < new_shape.size(); i++) {
-            if (new_shape[i] == -1) {
-                infer_count++;
-                infer_pos = static_cast<long>(i);
-            }
-            else if (new_shape[i] <= 0) {
-                throw std::invalid_argument(
-                    "reshape: dimensions must be positive or -1"
-                );
-            }
-            else {
-                known_product *= static_cast<size_t>(new_shape[i]);
-            }
-        }
-
-        if (infer_count > 1) {
-            throw std::invalid_argument(
-                "reshape: only one dimension can be inferred"
-            );
-        }
-
-        std::vector<size_t> final_shape;
-        final_shape.reserve(new_shape.size());
-
-        if (infer_count == 1) {
-            if (known_product == 0 || numel() % known_product != 0) {
-                throw std::invalid_argument(
-                    "reshape: cannot infer dimension"
-                );
-            }
-
-            size_t inferred = numel() / known_product;
-
-            for (size_t i = 0; i < new_shape.size(); i++) {
-                if (static_cast<long>(i) == infer_pos) {
-                    final_shape.push_back(inferred);
-                } else {
-                    final_shape.push_back(
-                        static_cast<size_t>(new_shape[i])
-                    );
-                }
-            }
-        }
-        else {
-            for (long dim : new_shape) {
-                final_shape.push_back(
-                    static_cast<size_t>(dim)
-                );
-            }
-        }
-
-        size_t new_numel = numel_from_shape(final_shape);
-
-        if (new_numel != numel()) {
-            throw std::invalid_argument(
-                "reshape element mismatch\n"
-                "  ❌ Current tensor has " + std::to_string(numel()) +
-                " elements\n"
-                "  ❌ Requested shape requires " +
-                std::to_string(new_numel) + " elements"
-            );
-        }
-
-        // PyTorch reshape semantics:
-        // contiguous -> view
-        // non-contiguous -> copy then reshape
-        if (!is_contiguous()) {
-            return contiguous().reshape(new_shape);
-        }
-
-        Tensor out = shallow_copy();
-
-        out.shape = final_shape;
-        out.strides = compute_strides(final_shape);
-
-        return out;
-    }
-    Tensor view(const std::vector<long>& new_shape) const {
-        if (!is_contiguous()) {
-            throw std::invalid_argument(
-                "view requires a contiguous tensor\n"
-                "  ❌ This tensor is not contiguous\n"
-                "  💡 view() never copies data, so it cannot reshape non-contiguous tensors\n"
-                "  🔧 Fix: call tensor.contiguous().view(...) or use tensor.reshape(...)"
-            );
-        }
-
-        return reshape(new_shape);
-    }
+    Tensor view(const std::vector<long>& new_shape) const;
+    
     Tensor slice(size_t dim,
                 size_t start,
                 size_t stop) const
@@ -490,8 +396,6 @@ public:
         std::ostringstream oss;
         oss << "[";
 
-        // TODO Phase C: route through at()/to_vector()
-        // so non-contiguous views print logical values correctly.
         for (size_t i = 0; i < numel(); i++) {
             oss << (*storage)[offset + i];
             if (i + 1 < numel()) oss << ", ";
@@ -629,91 +533,20 @@ public:
 
         return Tensor(std::move(data), shape);
     }
-    Tensor sum(std::optional<int> axis = std::nullopt,
-            bool keepdims = false) const {
-        // Case 1: reduce all elements -> scalar
-        if (!axis.has_value()) {
-            double total = 0.0;
+    Tensor sum(
+    std::optional<int> axis = std::nullopt,
+    bool keepdims = false
+    ) const;
 
-            if (numel() == 0) {
-                return Tensor(0.0f);
-            }
-
-            if (ndim() == 0) {
-                return Tensor(at({}));
-            }
-
-            std::vector<size_t> idx(shape.size(), 0);
-
-            total += static_cast<double>(at(idx));
-
-            while (next_index(idx, shape)) {
-                total += static_cast<double>(at(idx));
-            }
-
-            return Tensor(static_cast<float>(total));
-        }
-
-        // Case 2: reduce along one axis
-        int ax = normalize_axis(axis.value());
-
-        std::vector<size_t> out_shape =
-            reduction_shape(ax, keepdims);
-
-        Tensor out = zeros(out_shape);
-
-        if (numel() == 0) {
-            return out;
-        }
-
-        std::vector<size_t> in_idx(shape.size(), 0);
-
-        {
-            auto out_idx =
-                reduction_index(in_idx, ax, keepdims);
-
-            out.at(out_idx) += at(in_idx);
-        }
-
-        while (next_index(in_idx, shape)) {
-            auto out_idx =
-                reduction_index(in_idx, ax, keepdims);
-
-            out.at(out_idx) += at(in_idx);
-        }
-
-        return out;
-    }
     Tensor mean(std::optional<int> axis = std::nullopt,
-                bool keepdims = false) const
-    {
-        if (numel() == 0) {
-            return Tensor(
-                std::numeric_limits<float>::quiet_NaN()
-            );
-        }
+                bool keepdims = false) const;
 
-        Tensor s = sum(axis, keepdims);
-
-        float count;
-
-        if (!axis.has_value()) {
-            count = static_cast<float>(numel());
-        }
-        else {
-            int ax = normalize_axis(axis.value());
-            count = static_cast<float>(shape[ax]);
-        }
-
-        return s / count;
-    }
     Tensor max(std::optional<int> axis = std::nullopt,
             bool keepdims = false) const
     {
         float neg_inf =
             -std::numeric_limits<float>::infinity();
 
-        // Case 1: max over all elements
         if (!axis.has_value()) {
             if (numel() == 0) {
                 return Tensor(neg_inf);
@@ -736,7 +569,6 @@ public:
             return Tensor(best);
         }
 
-        // Case 2: max along axis
         int ax = normalize_axis(axis.value());
 
         std::vector<size_t> out_shape =
@@ -770,7 +602,6 @@ public:
     Tensor argmax(std::optional<int> axis = std::nullopt,
                 bool keepdims = false) const
     {
-        // Global argmax
         if (!axis.has_value()) {
 
             if (numel() == 0) {
@@ -805,7 +636,6 @@ public:
             return Tensor(best_idx);
         }
 
-        // Axis argmax
         int ax = normalize_axis(axis.value());
 
         auto out_shape =
@@ -987,9 +817,7 @@ public:
         return Tensor(std::move(out), {M, N});
     }
 
-    Tensor matmul(const Tensor& other) const {
-        return matmul_blocked(other);
-    }
+    Tensor matmul(const Tensor& other) const;
 
     Tensor fast_matmul_eigen(const Tensor& other) const {
         validate_matmul_2d(other);
@@ -1023,12 +851,51 @@ public:
                 "  💡 item() extracts the one value from a scalar/size-1 tensor\n"
                 "  🔧 Fix: reduce to a scalar first, or index a single element"
             );
-        std::vector<size_t> z(shape.size(), 0);   // {0,0,...} or {} for 0-D
+        std::vector<size_t> z(shape.size(), 0);
         return at(z);
     }
 
+    bool requires_grad() const {
+        return autograd && autograd->requires_grad;
+    }
+    void set_requires_grad(bool value) {
+        ensure_autograd();
+        autograd->requires_grad = value;
+    }
+
+    void zero_grad() {
+        if (autograd) {
+            autograd->grad_initialized = false;
+        }
+    }
+    Tensor& grad() {
+        if (!autograd || !autograd->grad_initialized) {
+            throw std::runtime_error("grad is not initialized");
+        }
+
+        return *autograd->grad;
+    }
+
+    const Tensor& grad() const {
+        if (!autograd || !autograd->grad_initialized) {
+            throw std::runtime_error("grad is not initialized");
+        }
+
+        return *autograd->grad;
+    }
+    void ensure_autograd() {
+        if (!autograd) {
+            autograd = std::make_shared<AutogradMeta>();
+        }
+    }
+
+    void backward();
+
+    void backward(const Tensor& grad_output);
 
 
+    
+    
 };
 
 inline std::ostream& operator<<(std::ostream& os, const Tensor& t) {
@@ -1060,7 +927,7 @@ inline Tensor arange(float start, float stop, float step = 1.0f) {
     if (step > 0) { for (float i = start; i < stop; i += step) data.push_back(i); }
     else          { for (float i = start; i > stop; i += step) data.push_back(i); }
 
-    size_t n = data.size();                       // read BEFORE the move
+    size_t n = data.size();
     return Tensor(std::move(data), {n});
 }
 
@@ -1131,8 +998,366 @@ inline std::vector<size_t> broadcast_shapes(
 
     return result;
 }
+inline Tensor reduce_grad_to_shape(
+    Tensor grad,
+    const std::vector<size_t>& target_shape
+) {
+    while (grad.ndim() > target_shape.size()) {
+        grad = grad.sum(0, false);
+    }
+
+    for (size_t d = 0; d < target_shape.size(); d++) {
+        if (target_shape[d] == 1 && grad.shape[d] != 1) {
+            grad = grad.sum(d, true);
+        }
+    }
+
+    if (grad.shape != target_shape) {
+        throw std::runtime_error(
+            "reduce_grad_to_shape: final shape mismatch"
+        );
+    }
+
+    return grad;
+}
+inline Tensor make_tracked(
+    Tensor result,
+    std::shared_ptr<Function> fn,
+    const std::vector<Tensor>& inputs
+);
+
+// Forward declarations needed by the *Backward structs below, whose
+// backward() methods use these operators before their definitions appear.
+inline Tensor operator*(const Tensor& a, const Tensor& b);
+inline Tensor operator/(const Tensor& a, const Tensor& b);
+inline Tensor operator*(const Tensor& a, float b);
+inline Tensor operator/(const Tensor& a, float b);
+
+struct AddBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& a = inputs[0];
+        const Tensor& b = inputs[1];
+
+        Tensor grad_a =
+            reduce_grad_to_shape(grad_output, a.shape);
+
+        Tensor grad_b =
+            reduce_grad_to_shape(grad_output, b.shape);
+
+        return {grad_a, grad_b};
+    }
+};
+struct MulBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& a = inputs[0];
+        const Tensor& b = inputs[1];
+
+        Tensor grad_a =
+            reduce_grad_to_shape(grad_output * b, a.shape);
+
+        Tensor grad_b =
+            reduce_grad_to_shape(grad_output * a, b.shape);
+
+        return {grad_a, grad_b};
+    }
+};
+struct SubBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& a = inputs[0];
+        const Tensor& b = inputs[1];
+
+        Tensor grad_a =
+            reduce_grad_to_shape(grad_output, a.shape);
+
+        Tensor grad_b =
+            reduce_grad_to_shape(grad_output * -1.0f, b.shape);
+
+        return {grad_a, grad_b};
+    }
+};
+
+struct DivBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& a = inputs[0];
+        const Tensor& b = inputs[1];
+
+        Tensor grad_a =
+            reduce_grad_to_shape(
+                grad_output / b,
+                a.shape
+            );
+
+       Tensor grad_b =
+            reduce_grad_to_shape(
+            grad_output * ((a * -1.0f) / (b * b)),
+            b.shape
+        );
+
+        return {grad_a, grad_b};
+    }
+};
+struct MatMulBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& a = inputs[0];
+        const Tensor& b = inputs[1];
+
+        Tensor grad_a =
+            grad_output.matmul(
+                b.transpose()
+            );
+
+        Tensor grad_b =
+            a.transpose().matmul(
+                grad_output
+            );
+
+        return {grad_a, grad_b};
+    }
+};
+
+struct SumBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            ones(x.shape) * grad_output;
+
+        return {grad_x};
+    }
+};
 
 
+struct MeanBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            ones(x.shape) *
+            (grad_output / static_cast<float>(x.numel()));
+
+        return {grad_x};
+    }
+};
+inline Tensor gt(const Tensor& a, float b);
+struct ReLUBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor mask = gt(x, 0.0f);
+
+        Tensor grad_x =
+            grad_output * mask;
+
+        return {grad_x};
+    }
+};
+
+struct NegBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        return {grad_output * -1.0f};
+    }
+};
+inline Tensor exp(const Tensor& a);
+struct ExpBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            grad_output * exp(x);
+
+        return {grad_x};
+    }
+};
+
+inline Tensor log(const Tensor& a);
+struct LogBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            grad_output / x;
+
+        return {grad_x};
+    }
+};
+inline Tensor sqrt(const Tensor& a);
+struct SqrtBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            grad_output /
+            (sqrt(x) * 2.0f);
+
+        return {grad_x};
+    }
+};
+
+
+inline Tensor operator-(const Tensor& a, const Tensor& b);
+inline Tensor neg(const Tensor& a);
+inline Tensor sigmoid(const Tensor& a);
+struct SigmoidBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor s = sigmoid(x);
+
+        Tensor grad_x =
+            grad_output * s * (Tensor(1.0f) - s);
+
+        return {grad_x};
+    }
+};
+inline Tensor tanh(const Tensor& a);
+
+struct TanhBackward : Function {
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor t = tanh(x);
+
+        Tensor grad_x =
+            grad_output *
+            (Tensor(1.0f) - (t * t));
+
+        return {grad_x};
+    }
+};
+
+
+inline Tensor Tensor::matmul(const Tensor& other) const {
+    Tensor result = matmul_blocked(other);
+
+    auto fn = std::make_shared<MatMulBackward>();
+
+    return make_tracked(result, fn, {*this, other});
+}
+inline Tensor Tensor::sum(
+    std::optional<int> axis,
+    bool keepdims
+) const {
+        if (!axis.has_value()) {
+            double total = 0.0;
+
+            if (numel() == 0) {
+                return Tensor(0.0f);
+            }
+
+            if (ndim() == 0) {
+                return Tensor(at({}));
+            }
+
+            std::vector<size_t> idx(shape.size(), 0);
+
+            total += static_cast<double>(at(idx));
+
+            while (next_index(idx, shape)) {
+                total += static_cast<double>(at(idx));
+            }
+
+            Tensor result(static_cast<float>(total));
+
+            auto fn = std::make_shared<SumBackward>();
+
+            return make_tracked(result, fn, {*this});
+        }
+
+        int ax = normalize_axis(axis.value());
+
+        std::vector<size_t> out_shape =
+            reduction_shape(ax, keepdims);
+
+        Tensor out = zeros(out_shape);
+
+        if (numel() == 0) {
+            return out;
+        }
+
+        std::vector<size_t> in_idx(shape.size(), 0);
+
+        {
+            auto out_idx =
+                reduction_index(in_idx, ax, keepdims);
+
+            out.at(out_idx) += at(in_idx);
+        }
+
+        while (next_index(in_idx, shape)) {
+            auto out_idx =
+                reduction_index(in_idx, ax, keepdims);
+
+            out.at(out_idx) += at(in_idx);
+        }
+
+        return out;
+    }
+    inline Tensor Tensor::mean(
+    std::optional<int> axis,
+    bool keepdims
+) const {
+    if (numel() == 0) {
+        return Tensor(
+            std::numeric_limits<float>::quiet_NaN()
+        );
+    }
+
+    Tensor s = sum(axis, keepdims);
+
+    float count;
+
+    if (!axis.has_value()) {
+        count = static_cast<float>(numel());
+    }
+    else {
+        int ax = normalize_axis(axis.value());
+        count = static_cast<float>(shape[ax]);
+    }
+
+    Tensor result = s / count;
+
+    if (!axis.has_value()) {
+        auto fn = std::make_shared<MeanBackward>();
+
+        return make_tracked(result, fn, {*this});
+    }
+
+    return result;
+}
 template <class F>
 inline Tensor binary_op(const Tensor& a, const Tensor& b, F f) {
     auto out_shape = broadcast_shapes(a.shape, b.shape);
@@ -1143,7 +1368,6 @@ inline Tensor binary_op(const Tensor& a, const Tensor& b, F f) {
     size_t total = numel_from_shape(out_shape);
     std::vector<float> out(total);
 
-    // Fast path: same shape + contiguous memory
     if (A.shape == B.shape && A.is_contiguous() && B.is_contiguous()) {
         for (size_t i = 0; i < total; i++) {
             out[i] = f(
@@ -1155,13 +1379,11 @@ inline Tensor binary_op(const Tensor& a, const Tensor& b, F f) {
         return Tensor(std::move(out), out_shape);
     }
 
-    // Scalar case: shape {}
     if (out_shape.empty()) {
         out[0] = f(A.at({}), B.at({}));
         return Tensor(std::move(out), out_shape);
     }
 
-    // General path: works for broadcasted/non-contiguous tensors
     std::vector<size_t> idx(out_shape.size(), 0);
 
     size_t k = 0;
@@ -1174,21 +1396,48 @@ inline Tensor binary_op(const Tensor& a, const Tensor& b, F f) {
     return Tensor(std::move(out), out_shape);
 }
 inline Tensor operator+(const Tensor& a, const Tensor& b) {
-    return binary_op(a, b, [](float x, float y) { return x + y; });
+    Tensor result =
+        binary_op(a, b, [](float x, float y) {
+            return x + y;
+        });
+
+    auto fn = std::make_shared<AddBackward>();
+
+    return make_tracked(result, fn, {a, b});
 }
 
 inline Tensor operator-(const Tensor& a, const Tensor& b) {
-    return binary_op(a, b, [](float x, float y) { return x - y; });
-}
+    Tensor result =
+        binary_op(a, b, [](float x, float y) {
+            return x - y;
+        });
 
+    auto fn = std::make_shared<SubBackward>();
+
+    return make_tracked(result, fn, {a, b});
+}
 inline Tensor operator*(const Tensor& a, const Tensor& b) {
-    return binary_op(a, b, [](float x, float y) { return x * y; });
+    Tensor result =
+        binary_op(a, b, [](float x, float y) {
+            return x * y;
+        });
+
+    auto fn = std::make_shared<MulBackward>();
+
+    return make_tracked(result, fn, {a, b});
 }
 
 // Float32 division intentionally follows NumPy behavior:
 // division by zero gives inf/nan.
 inline Tensor operator/(const Tensor& a, const Tensor& b) {
-    return binary_op(a, b, [](float x, float y) { return x / y; });
+    Tensor result =
+        binary_op(a, b, [](float x, float y) {
+            return x / y;
+        });
+
+    auto fn = std::make_shared<DivBackward>();
+
+    return make_tracked(result, fn, {a, b});
 }
 inline Tensor operator+(const Tensor& a, float b) {
     return a + Tensor(b);
@@ -1222,9 +1471,6 @@ inline Tensor operator/(float a, const Tensor& b) {
     return Tensor(a) / b;
 }
 
-
-
-
 template <class F>
 inline Tensor unary_op(const Tensor& a, F f) {
     std::vector<float> out;
@@ -1251,27 +1497,356 @@ inline Tensor unary_op(const Tensor& a, F f) {
 }
 
 inline Tensor exp(const Tensor& a) {
-    return unary_op(a, [](float x) { return std::exp(x); });
+    Tensor result =
+        unary_op(a, [](float x) {
+            return std::exp(x);
+        });
+
+    auto fn =
+        std::make_shared<ExpBackward>();
+
+    return make_tracked(result, fn, {a});
 }
 
 inline Tensor log(const Tensor& a) {
-    return unary_op(a, [](float x) { return std::log(x); });
+
+    Tensor result =
+        unary_op(a, [](float x) {
+            return std::log(x);
+        });
+
+    auto fn =
+        std::make_shared<LogBackward>();
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
 }
 
 inline Tensor sqrt(const Tensor& a) {
-    return unary_op(a, [](float x) { return std::sqrt(x); });
+
+    Tensor result =
+        unary_op(a, [](float x) {
+            return std::sqrt(x);
+        });
+
+    auto fn =
+        std::make_shared<SqrtBackward>();
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
+}
+
+
+inline Tensor sigmoid(const Tensor& a) {
+
+    Tensor result =
+        Tensor(1.0f) /
+        (Tensor(1.0f) + exp(neg(a)));
+
+    auto fn =
+        std::make_shared<SigmoidBackward>();
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
+}
+inline Tensor tanh(const Tensor& a) {
+
+    Tensor result =
+        unary_op(
+            a,
+            [](float x) {
+                return std::tanh(x);
+            }
+        );
+
+    auto fn =
+        std::make_shared<TanhBackward>();
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
 }
 
 inline Tensor abs(const Tensor& a) {
     return unary_op(a, [](float x) { return std::fabs(x); });
 }
 
+
+inline Tensor pow(const Tensor& a, float exponent);
+struct PowBackward : Function {
+    float exponent;
+
+    explicit PowBackward(float exponent)
+        : exponent(exponent) {}
+
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        const Tensor& x = inputs[0];
+
+        Tensor grad_x =
+            grad_output *
+            exponent *
+            pow(x, exponent - 1.0f);
+
+        return {grad_x};
+    }
+};
+inline Tensor pow(
+    const Tensor& a,
+    float exponent
+) {
+    Tensor result =
+        unary_op(
+            a,
+            [exponent](float x) {
+                return std::pow(x, exponent);
+            }
+        );
+
+    auto fn =
+        std::make_shared<PowBackward>(
+            exponent
+        );
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
+}
+
+struct ReshapeBackward : Function {
+    std::vector<size_t> original_shape;
+
+    explicit ReshapeBackward(
+        const std::vector<size_t>& original_shape
+    )
+        : original_shape(original_shape) {}
+
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        Tensor grad_x =
+            grad_output.reshape(
+                std::vector<long>(
+                    original_shape.begin(),
+                    original_shape.end()
+                )
+            );
+
+        return {grad_x};
+    }
+};
+struct TransposeBackward : Function {
+    int d0;
+    int d1;
+
+    TransposeBackward(int d0, int d1)
+        : d0(d0), d1(d1) {}
+
+    std::vector<Tensor> backward(
+        const Tensor& grad_output
+    ) override {
+
+        Tensor grad_x =
+            grad_output.transpose(
+                d0,
+                d1
+            );
+
+        return {grad_x};
+    }
+};
+inline Tensor Tensor::transpose(int d0, int d1) const
+{
+    if (ndim() < 2 && d0 == -2 && d1 == -1) {
+            return shallow_copy();
+        }
+
+        int n = static_cast<int>(ndim());
+
+        if (d0 < 0) d0 += n;
+        if (d1 < 0) d1 += n;
+
+        if (d0 < 0 || d0 >= n || d1 < 0 || d1 >= n) {
+            throw std::out_of_range(
+                "Transpose dimension out of range\n"
+                "  ❌ Invalid dimensions\n"
+                "  💡 Dimensions must be in [-ndim(), ndim()-1]"
+            );
+        }
+
+        Tensor out = shallow_copy();
+
+        std::swap(out.shape[d0], out.shape[d1]);
+        std::swap(out.strides[d0], out.strides[d1]);
+
+        auto fn =
+        std::make_shared<TransposeBackward>(
+            d0,
+            d1
+        );
+
+    return make_tracked(
+        out,
+        fn,
+        {*this}
+    );
+}
+
+inline Tensor Tensor::reshape(const std::vector<long> &new_shape) const
+{
+    int infer_count = 0;
+    long infer_pos = -1;
+
+    size_t known_product = 1;
+
+    for (size_t i = 0; i < new_shape.size(); i++)
+    {
+        if (new_shape[i] == -1)
+        {
+            infer_count++;
+            infer_pos = static_cast<long>(i);
+        }
+        else if (new_shape[i] <= 0)
+        {
+            throw std::invalid_argument(
+                "reshape: dimensions must be positive or -1");
+        }
+        else
+        {
+            known_product *= static_cast<size_t>(new_shape[i]);
+        }
+    }
+
+    if (infer_count > 1)
+    {
+        throw std::invalid_argument(
+            "reshape: only one dimension can be inferred");
+    }
+
+    std::vector<size_t> final_shape;
+    final_shape.reserve(new_shape.size());
+
+    if (infer_count == 1)
+    {
+        if (known_product == 0 || numel() % known_product != 0)
+        {
+            throw std::invalid_argument(
+                "reshape: cannot infer dimension");
+        }
+
+        size_t inferred = numel() / known_product;
+
+        for (size_t i = 0; i < new_shape.size(); i++)
+        {
+            if (static_cast<long>(i) == infer_pos)
+            {
+                final_shape.push_back(inferred);
+            }
+            else
+            {
+                final_shape.push_back(
+                    static_cast<size_t>(new_shape[i]));
+            }
+        }
+    }
+    else
+    {
+        for (long dim : new_shape)
+        {
+            final_shape.push_back(
+                static_cast<size_t>(dim));
+        }
+    }
+
+    size_t new_numel = numel_from_shape(final_shape);
+
+    if (new_numel != numel())
+    {
+        throw std::invalid_argument(
+            "reshape element mismatch\n"
+            "  ❌ Current tensor has " +
+            std::to_string(numel()) +
+            " elements\n"
+            "  ❌ Requested shape requires " +
+            std::to_string(new_numel) + " elements");
+    }
+
+    if (!is_contiguous())
+    {
+        return contiguous().reshape(new_shape);
+    }
+
+    Tensor out = shallow_copy();
+
+    out.shape = final_shape;
+    out.strides = compute_strides(final_shape);
+
+    auto fn =
+        std::make_shared<ReshapeBackward>(
+            shape);
+
+    return make_tracked(
+        out,
+        fn,
+        {*this});
+}
+    inline Tensor Tensor::view(
+        const std::vector<long> &new_shape) const
+    {
+        if (!is_contiguous())
+        {
+            throw std::invalid_argument(
+                "view requires a contiguous tensor");
+        }
+
+        return reshape(new_shape);
+    }
 inline Tensor relu(const Tensor& a) {
-    return unary_op(a, [](float x) { return x > 0.0f ? x : 0.0f; });
+
+    Tensor result =
+        unary_op(
+            a,
+            [](float x) {
+                return x > 0.0f ? x : 0.0f;
+            }
+        );
+
+    auto fn =
+        std::make_shared<ReLUBackward>();
+
+    return make_tracked(
+        result,
+        fn,
+        {a}
+    );
 }
 
 inline Tensor neg(const Tensor& a) {
-    return unary_op(a, [](float x) { return -x; });
+    Tensor result =
+        unary_op(a, [](float x) {
+            return -x;
+        });
+
+    auto fn =
+        std::make_shared<NegBackward>();
+
+    return make_tracked(result, fn, {a});
 }
 
 inline Tensor operator-(const Tensor& a) {
@@ -1320,4 +1895,81 @@ inline Tensor ge(float a, const Tensor& b) { return ge(Tensor(a), b); }
 
 inline Tensor le(const Tensor& a, float b) { return le(a, Tensor(b)); }
 inline Tensor le(float a, const Tensor& b) { return le(Tensor(a), b); }
+
+inline Tensor make_tracked(
+    Tensor result,
+    std::shared_ptr<Function> fn,
+    const std::vector<Tensor>& inputs
+) {
+    bool need_grad = false;
+
+    for (const auto& input : inputs) {
+        if (input.requires_grad()) {
+            need_grad = true;
+            break;
+        }
+    }
+
+    if (!need_grad) {
+        return result;
+    }
+
+    result.ensure_autograd();
+    result.autograd->requires_grad = true;
+    result.autograd->grad_fn = fn;
+
+    fn->inputs = inputs;
+
+    return result;
+}
+
+inline void Tensor::backward() {
+    if (numel() != 1) {
+        throw std::runtime_error(
+            "backward() on non-scalar tensor requires grad_output"
+        );
+    }
+
+    backward(ones(shape));
+}
+inline void Tensor::backward(const Tensor& grad_output) {
+    if (!requires_grad()) {
+        return;
+    }
+
+    if (grad_output.shape != shape) {
+        throw std::runtime_error(
+            "backward: grad_output shape mismatch"
+        );
+    }
+
+    if (!autograd->grad_initialized) {
+        autograd->grad =
+            std::make_shared<Tensor>(grad_output);
+
+        autograd->grad_initialized = true;
+    } else {
+        *autograd->grad =
+            *autograd->grad + grad_output;
+    }
+
+    if (autograd->grad_fn) {
+        std::vector<Tensor> input_grads =
+            autograd->grad_fn->backward(grad_output);
+
+        if (input_grads.size() != autograd->grad_fn->inputs.size()) {
+            throw std::runtime_error(
+                "backward: number of gradients does not match inputs"
+            );
+        }
+
+        for (size_t i = 0; i < input_grads.size(); i++) {
+            Tensor& input = autograd->grad_fn->inputs[i];
+
+            if (input.requires_grad()) {
+                input.backward(input_grads[i]);
+            }
+        }
+    }
+}
 } // namespace tinytorch
